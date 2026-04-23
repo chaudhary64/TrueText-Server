@@ -88,7 +88,14 @@ if (!fs.existsSync(modelPath)) {
 let sessionPromise;
 function getSession() {
   if (!sessionPromise) {
-    sessionPromise = ort.InferenceSession.create(modelPath);
+    sessionPromise = ort.InferenceSession.create(modelPath, {
+      executionProviders: ["cpu"],
+    }).catch((error) => {
+      log("warn", "CPU execution provider init failed, falling back", {
+        error: error.message,
+      });
+      return ort.InferenceSession.create(modelPath);
+    });
   }
   return sessionPromise;
 }
