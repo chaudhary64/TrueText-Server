@@ -63,41 +63,87 @@ app.use((error, _req, res, next) => {
 });
 
 const modelsDir = path.resolve(__dirname, "models");
-const metaPath = path.join(modelsDir, "model_meta.json");
 
-if (!fs.existsSync(metaPath)) {
-  throw new Error(`Missing model metadata file at ${metaPath}`);
+// Discover all model directories and load their metadata
+function discoverModels() {
+  const models = {};
+
+  if (!fs.existsSync(modelsDir)) {
+    throw new Error(`Models directory not found at ${modelsDir}`);
+  }
+
+  const entries = fs.readdirSync(modelsDir, { withFileTypes: true });
+  const modelDirs = entries.filter((entry) => entry.isDirectory());
+
+  if (modelDirs.length === 0) {
+    throw new Error(`No model directories found in ${modelsDir}`);
+  }
+
+  // Check if metadata exists at root level
+  const metaPath = path.join(modelsDir, "model_meta.json");
+  if (!fs.existsSync(metaPath)) {
+    throw new Error(`Missing model_meta.json in ${modelsDir}`);
+  }
+
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  const relativeOnnxPath = meta.onnx_path || "fake_detector.onnx";
+  const onnxModelPath = path.resolve(modelsDir, relativeOnnxPath);
+
+  if (!fs.existsSync(onnxModelPath)) {
+    throw new Error(`Missing ONNX file at ${onnxModelPath}`);
+  }
+
+  // Create a model entry for each discovered directory
+  for (const dir of modelDirs) {
+    const modelName = dir.name;
+
+    models[modelName] = {
+      name: modelName,
+      path: onnxModelPath,
+      metadata: meta,
+      imageSize: meta.image_size || 512,
+      imageMean: Array.isArray(meta.image_mean)
+        ? meta.image_mean
+        : [0.5, 0.5, 0.5],
+      imageStd: Array.isArray(meta.image_std)
+        ? meta.image_std
+        : [0.5, 0.5, 0.5],
+      sessionPromise: null,
+    };
+
+    log("info", `Discovered model: ${modelName}`);
+  }
+
+  if (Object.keys(models).length === 0) {
+    throw new Error(`No valid models found in ${modelsDir}`);
+  }
+
+  return models;
 }
 
-const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-const imageSize = meta.image_size || 512;
-const imageMean = Array.isArray(meta.image_mean)
-  ? meta.image_mean
-  : [0.5, 0.5, 0.5];
-const imageStd = Array.isArray(meta.image_std)
-  ? meta.image_std
-  : [0.5, 0.5, 0.5];
+const models = discoverModels();
 
-const relativeOnnxPath = meta.onnx_path || "./fake_detector.onnx";
-const modelPath = path.resolve(modelsDir, relativeOnnxPath);
+function getSession(modelName) {
+  const model = models[modelName];
+  if (!model) {
+    throw new Error(`Model ${modelName} not found`);
+  }
 
-if (!fs.existsSync(modelPath)) {
-  throw new Error(`Missing ONNX model file at ${modelPath}`);
-}
-
-let sessionPromise;
-function getSession() {
-  if (!sessionPromise) {
-    sessionPromise = ort.InferenceSession.create(modelPath, {
+  if (!model.sessionPromise) {
+    model.sessionPromise = ort.InferenceSession.create(model.path, {
       executionProviders: ["cpu"],
     }).catch((error) => {
-      log("warn", "CPU execution provider init failed, falling back", {
-        error: error.message,
-      });
-      return ort.InferenceSession.create(modelPath);
+      log(
+        "warn",
+        `CPU execution provider init failed for ${modelName}, falling back`,
+        {
+          error: error.message,
+        },
+      );
+      return ort.InferenceSession.create(model.path);
     });
   }
-  return sessionPromise;
+  return model.sessionPromise;
 }
 
 function softmax(values) {
@@ -127,7 +173,7 @@ function getImageBufferFromRequest(req) {
   return null;
 }
 
-async function preprocessImage(buffer) {
+async function preprocessImage(buffer, imageSize, imageMean, imageStd) {
   const { data, info } = await sharp(buffer)
     .rotate()
     .removeAlpha()
@@ -160,17 +206,45 @@ async function preprocessImage(buffer) {
   return tensorData;
 }
 
-app.get("/health", async (_req, res) => {
+app.get("/", async (_req, res) => {
   try {
-    const session = await getSession();
-    log("info", "Health check passed");
-    res.json({
-      status: "ok",
-      model: {
-        name: meta.model_name,
-        path: modelPath,
-        inputNames: session.inputNames,
-        outputNames: session.outputNames,
+    const modelStatuses = {};
+    const errors = [];
+
+    for (const [modelName, model] of Object.entries(models)) {
+      try {
+        const session = await getSession(modelName);
+        modelStatuses[modelName] = {
+          status: "ok",
+          model: {
+            name: model.metadata.model_name || modelName,
+            path: model.path,
+            inputNames: session.inputNames,
+            outputNames: session.outputNames,
+          },
+        };
+      } catch (error) {
+        errors.push({ model: modelName, error: error.message });
+        modelStatuses[modelName] = {
+          status: "error",
+          error: error.message,
+        };
+      }
+    }
+
+    const allHealthy = errors.length === 0;
+    log("info", `Health check completed`, {
+      totalModels: Object.keys(models).length,
+      healthyModels: Object.keys(models).length - errors.length,
+    });
+
+    return res.json({
+      status: allHealthy ? "ok" : "partial",
+      models: modelStatuses,
+      summary: {
+        totalModels: Object.keys(models).length,
+        healthyModels: Object.keys(models).length - errors.length,
+        errors: errors.length > 0 ? errors : undefined,
       },
     });
   } catch (error) {
@@ -194,69 +268,113 @@ app.post("/predict", upload.single("image"), async (req, res) => {
       });
     }
 
-    const session = await getSession();
-    const inputName = session.inputNames[0];
-    const outputName = session.outputNames[0];
+    // Run inference on all models concurrently
+    const predictionPromises = Object.entries(models).map(
+      async ([modelName, model]) => {
+        try {
+          const session = await getSession(modelName);
+          const inputName = session.inputNames[0];
+          const outputName = session.outputNames[0];
 
-    const inputData = await preprocessImage(imageBuffer);
-    const inputTensor = new ort.Tensor("float32", inputData, [
-      1,
-      3,
-      imageSize,
-      imageSize,
-    ]);
+          // Preprocess image with model-specific parameters
+          const inputData = await preprocessImage(
+            imageBuffer,
+            model.imageSize,
+            model.imageMean,
+            model.imageStd,
+          );
 
-    const result = await session.run({ [inputName]: inputTensor });
-    const outputTensor = result[outputName] || result[Object.keys(result)[0]];
+          const inputTensor = new ort.Tensor("float32", inputData, [
+            1,
+            3,
+            model.imageSize,
+            model.imageSize,
+          ]);
 
-    if (!outputTensor || !outputTensor.data) {
-      log("error", "Model returned empty output tensor");
+          const result = await session.run({ [inputName]: inputTensor });
+          const outputTensor =
+            result[outputName] || result[Object.keys(result)[0]];
+
+          if (!outputTensor || !outputTensor.data) {
+            throw new Error("Model returned empty output tensor");
+          }
+
+          const rawScores = Array.from(outputTensor.data);
+          let probabilities;
+
+          if (rawScores.length === 1) {
+            const fakeProb = sigmoid(rawScores[0]);
+            probabilities = [1 - fakeProb, fakeProb];
+          } else {
+            probabilities = softmax(rawScores);
+          }
+
+          const classIds = Object.keys(model.metadata.classes || {}).sort(
+            (a, b) => Number(a) - Number(b),
+          );
+          const labels = classIds.length
+            ? classIds.map((id) => model.metadata.classes[id])
+            : probabilities.map((_value, index) => `Class ${index}`);
+
+          const bestIndex = probabilities.reduce(
+            (best, current, index, arr) => (current > arr[best] ? index : best),
+            0,
+          );
+
+          const responseProbabilities = probabilities.map(
+            (probability, index) => ({
+              classId: classIds[index] || String(index),
+              label: labels[index] || `Class ${index}`,
+              probability,
+            }),
+          );
+
+          return {
+            modelName,
+            predictedClassId: classIds[bestIndex] || String(bestIndex),
+            predictedClass: labels[bestIndex] || `Class ${bestIndex}`,
+            confidence: probabilities[bestIndex],
+            probabilities: responseProbabilities,
+            modelMetadata: {
+              name: model.metadata.model_name || modelName,
+              imageSize: model.imageSize,
+            },
+          };
+        } catch (error) {
+          throw new Error(
+            `Prediction failed for model ${modelName}: ${error.message}`,
+          );
+        }
+      },
+    );
+
+    // Wait for all models to complete
+    let results;
+    try {
+      results = await Promise.all(predictionPromises);
+    } catch (error) {
+      log("error", "Multi-model prediction failed", { error: error.message });
       return res.status(500).json({
-        message: "Model returned no output data.",
+        message: "Multi-model prediction failed.",
+        error: error.message,
       });
     }
 
-    const rawScores = Array.from(outputTensor.data);
-    let probabilities;
-
-    if (rawScores.length === 1) {
-      const fakeProb = sigmoid(rawScores[0]);
-      probabilities = [1 - fakeProb, fakeProb];
-    } else {
-      probabilities = softmax(rawScores);
-    }
-
-    const classIds = Object.keys(meta.classes || {}).sort(
-      (a, b) => Number(a) - Number(b),
-    );
-    const labels = classIds.length
-      ? classIds.map((id) => meta.classes[id])
-      : probabilities.map((_value, index) => `Class ${index}`);
-
-    const bestIndex = probabilities.reduce(
-      (best, current, index, arr) => (current > arr[best] ? index : best),
-      0,
-    );
-
-    const responseProbabilities = probabilities.map((probability, index) => ({
-      classId: classIds[index] || String(index),
-      label: labels[index] || `Class ${index}`,
-      probability,
-    }));
-
-    log("info", "Prediction completed", {
-      predictedClass: labels[bestIndex] || `Class ${bestIndex}`,
-      confidence: Number(probabilities[bestIndex].toFixed(4)),
+    log("info", "Multi-model prediction completed", {
+      modelsProcessed: results.length,
+      models: results.map((r) => ({
+        model: r.modelName,
+        predictedClass: r.predictedClass,
+        confidence: Number(r.confidence.toFixed(4)),
+      })),
     });
 
     return res.json({
-      predictedClassId: classIds[bestIndex] || String(bestIndex),
-      predictedClass: labels[bestIndex] || `Class ${bestIndex}`,
-      confidence: probabilities[bestIndex],
-      probabilities: responseProbabilities,
-      model: {
-        name: meta.model_name,
-        imageSize,
+      status: "success",
+      predictions: results,
+      summary: {
+        totalModels: results.length,
+        timestamp: new Date().toISOString(),
       },
     });
   } catch (error) {
