@@ -1,0 +1,8 @@
+{
+  "watch": ["server.js", "models/model_meta.json"],
+  "ext": "js,json",
+  "ignore": ["node_modules/**", "models/*.onnx", "models/*.onnx.data"],
+  "exec": "node server.js",
+  "delay": "200",
+  "quiet": true
+}
