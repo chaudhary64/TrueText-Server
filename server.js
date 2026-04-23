@@ -79,39 +79,53 @@ function discoverModels() {
     throw new Error(`No model directories found in ${modelsDir}`);
   }
 
-  // Check if metadata exists at root level
-  const metaPath = path.join(modelsDir, "model_meta.json");
-  if (!fs.existsSync(metaPath)) {
-    throw new Error(`Missing model_meta.json in ${modelsDir}`);
-  }
-
-  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-  const relativeOnnxPath = meta.onnx_path || "fake_detector.onnx";
-  const onnxModelPath = path.resolve(modelsDir, relativeOnnxPath);
-
-  if (!fs.existsSync(onnxModelPath)) {
-    throw new Error(`Missing ONNX file at ${onnxModelPath}`);
-  }
-
-  // Create a model entry for each discovered directory
+  // Load each model from its own directory: <models>/<modelName>/{model_meta.json,*.onnx}
   for (const dir of modelDirs) {
     const modelName = dir.name;
+    const modelPath = path.join(modelsDir, modelName);
+    const metaPath = path.join(modelPath, "model_meta.json");
 
-    models[modelName] = {
-      name: modelName,
-      path: onnxModelPath,
-      metadata: meta,
-      imageSize: meta.image_size || 512,
-      imageMean: Array.isArray(meta.image_mean)
-        ? meta.image_mean
-        : [0.5, 0.5, 0.5],
-      imageStd: Array.isArray(meta.image_std)
-        ? meta.image_std
-        : [0.5, 0.5, 0.5],
-      sessionPromise: null,
-    };
+    if (!fs.existsSync(metaPath)) {
+      log(
+        "warn",
+        `Skipping model ${modelName}: missing model_meta.json in ${modelPath}`,
+      );
+      continue;
+    }
 
-    log("info", `Discovered model: ${modelName}`);
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+      const relativeOnnxPath = meta.onnx_path || "fake_detector.onnx";
+      const onnxModelPath = path.resolve(modelPath, relativeOnnxPath);
+
+      if (!fs.existsSync(onnxModelPath)) {
+        log(
+          "warn",
+          `Skipping model ${modelName}: missing ONNX file at ${onnxModelPath}`,
+        );
+        continue;
+      }
+
+      models[modelName] = {
+        name: modelName,
+        path: onnxModelPath,
+        metadata: meta,
+        imageSize: meta.image_size || 512,
+        imageMean: Array.isArray(meta.image_mean)
+          ? meta.image_mean
+          : [0.5, 0.5, 0.5],
+        imageStd: Array.isArray(meta.image_std)
+          ? meta.image_std
+          : [0.5, 0.5, 0.5],
+        sessionPromise: null,
+      };
+
+      log("info", `Discovered model: ${modelName}`);
+    } catch (error) {
+      log("warn", `Error loading model ${modelName}`, {
+        error: error.message,
+      });
+    }
   }
 
   if (Object.keys(models).length === 0) {
